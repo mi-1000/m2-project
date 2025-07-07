@@ -1,7 +1,7 @@
 import os
 
 from dotenv import load_dotenv
-from typing import Any, Generator, Literal
+from typing import Any, Generator, Literal, Union
 
 from google import genai
 from google.genai import types
@@ -9,14 +9,14 @@ from google.genai import types
 load_dotenv()
 
 
-class GeminiChat:
+class Gemini:
     def __init__(
         self,
         system_instructions: str = "You are a helpful assistant.",
         model: str = "gemini-2.5-flash",
         temperature: int = 1,
         top_p: int = 1,
-        seed: int | Literal["random"] = "random",
+        seed: Union[int, Literal["random"]] = "random",
         max_output_tokens: int = 65535,
         thinking_budget: int = 2048,
     ):
