@@ -1,18 +1,21 @@
 import json
 import os
+import threading
+from collections import deque
 
-from librosa import ex
-from retico_core import network, AbstractModule
+from retico_core import network, AbstractModule, UpdateMessage, UpdateType
 from retico_core.text import TextIU
-from retico_mistyrobot.misty_action import MistyActionModule
-from retico_mistyrobot.mistyPy import Robot
-from LanguageDetectionModule.language_detection import (
-    SimpleTerminalInputModule,
-    LanguageDetectionModule,
-)
+from retico_core.audio import AudioIU, MicrophoneModule, SpeakerModule
+from retico_googleasr import GoogleASRModule
+
+from simple_terminal_input import SimpleTerminalInputModule
+from gemini import Gemini
+from LanguageDetectionModule.language_detection import LanguageDetectionModule
 from LanguageDetectionModule.multilingual_tts import MultilingualTTSModule
 
-from gemini import Gemini
+# Silence detection imports
+import numpy as np
+from librosa import stft, feature
 
 SYSTEM_PROMPT = """
 You are a friendly and knowledgeable language tutor. Help the user practice {language} by having a short, natural conversation about “{topic}” at level {difficulty_level}.
@@ -27,37 +30,171 @@ Guidelines:
 
 If asked, give cultural info, vocabulary, or grammar tips. Always be encouraging and keep answers short and clear.
 
-Start by greeting the user in {language} and asking a simple question about “{topic}” at level {difficulty_level}."""
+Start by greeting the user in {language} and asking a simple question about “{topic}” at level {difficulty_level}.
+"""
 
 # Load topics
-with open(
-    os.path.join(os.path.dirname(__file__), "topics.json"), encoding="utf-8"
-) as f:
+with open(os.path.join(os.path.dirname(__file__), "topics.json"), encoding="utf-8") as f:
     TOPICS = json.load(f)
 
-# Cache for user progress
+# Persistence
 PROGRESS_FILE = os.path.join(os.path.dirname(__file__), "user_progress.json")
-
 
 def load_progress():
     if os.path.exists(PROGRESS_FILE):
-        with open(PROGRESS_FILE, encoding="utf-8") as f:
-            return json.load(f)
+        return json.load(open(PROGRESS_FILE, encoding="utf-8"))
     return {}
 
-
 def save_progress(progress):
-    with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
-        json.dump(progress, f, ensure_ascii=False, indent=2)
+    json.dump(progress, open(PROGRESS_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+
+class AudioParameterGeminiModule(AbstractModule):
+    @staticmethod
+    def name(): return "Audio-Enabled Gemini Module"
+
+    @staticmethod
+    def description(): return "Handles text & audio, buffers mic audio until silence, sends to Gemini."
+
+    @staticmethod
+    def input_ius(): return [TextIU, AudioIU]
+
+    @staticmethod
+    def output_ius(): return [TextIU, AudioIU]
+
+    def __init__(self, topics, **kwargs):
+        super().__init__(**kwargs)
+        self.topics = topics
+        self.language = self.level = self.topic = self.explanation_language = None
+        self.idx = None
+        self._next_prompt = 'language'
+        self._gemini = None
+        self.progress = load_progress()
+        # Audio buffer for silence detection
+        self.audio_buffer = deque()
+        self.buffer_lock = threading.Lock()
+        self.silence_threshold = 0.01
+        self.noise_flatness_threshold = 0.8
+        self.silent_tail_sec = 1.0
+
+    def _ask_text(self, msg):
+        um = UpdateMessage()
+        um.add_iu(TextIU(text=msg), UpdateType.ADD)
+        self.append(um)
+
+    def _init_gemini(self):
+        prompt = SYSTEM_PROMPT.format(
+            language=self.language, topic=self.topic,
+            difficulty_level=self.level, explanation_language=self.explanation_language
+        )
+        self._gemini = Gemini(system_instructions=prompt, model="gemini-2.5-audioflash", streaming_audio=True)
+
+    def process_update(self, update):
+        for iu, _ in update:
+            if isinstance(iu, TextIU):
+                for chunk in self.process_text_iu(iu.text.strip()):
+                    self.append(TextIU(text=chunk))
+            elif isinstance(iu, AudioIU):
+                out = self.process_audio_iu(iu)
+                if out is None: continue
+                for chunk in out:
+                    self.append(TextIU(text=chunk))
+                    print("chunk")
+
+    def process_text_iu(self, text):
+        # Parameter collection & command handling same as before
+        if self._next_prompt:
+            return self._handle_param_text(text)
+        if text.lower() == 'next':
+            return self._handle_next()
+        if text.lower() == 'exit':
+            return self._handle_exit()
+        # send to Gemini
+        return self._gemini.add_turn(text)
+
+    def process_audio_iu(self, iu: AudioIU):
+        # buffer raw audio
+        with self.buffer_lock:
+            arr = np.frombuffer(iu.raw_audio, dtype=np.int16).astype(np.float32)/32768
+            self.audio_buffer.append(arr)
+            # maintain tail length
+            combined = np.concatenate(list(self.audio_buffer))
+            # if not enough or not silence end, continue buffering
+            if len(combined) < iu.rate * 1.0 or not self._is_silence(combined, iu.rate):
+                return None
+            # on silence end, clear buffer and send
+            self.audio_buffer.clear()
+        return self._gemini.add_audio_turn(combined.tobytes())
+
+    def _is_silence(self, buf, rate):
+        tail = buf[-int(self.silent_tail_sec*rate):]
+        rms = np.sqrt(np.mean(tail**2))
+        if rms < self.silence_threshold:
+            return True
+        S = np.abs(stft(tail, n_fft=512, hop_length=256))
+        flat = np.mean(feature.spectral_flatness(S=S))
+        return flat > self.noise_flatness_threshold
+
+    # Parameter & command handlers
+    def _handle_param_text(self, text):
+        step = self._next_prompt
+        if step == 'language':
+            self._ask_text("Lang?")
+            self._next_prompt='get_language'
+            return []
+        if step == 'get_language':
+            self.language = text or 'English'
+            self._ask_text(f"Lang {self.language}, level? {list(self.topics.keys())}")
+            self._next_prompt='get_level'
+            return []
+        if step == 'get_level':
+            self.level = text if text in self.topics else list(self.topics.keys())[0]
+            tlist=self.topics[self.level]
+            self._ask_text(f"Topics: {tlist}")
+            self._next_prompt='get_topic'
+            return []
+        if step == 'get_topic':
+            idx=int(text)-1 if text.isdigit() else 0
+            self.idx=idx
+            self.topic=self.topics[self.level][self.idx]
+            self._ask_text(f"Topic {self.topic}, explain in? (default {self.language})")
+            self._next_prompt='get_explanation'
+            return []
+        if step == 'get_explanation':
+            self.explanation_language = text or self.language
+            self._ask_text("Starting...")
+            self._init_gemini()
+            self._ask_text(f"Parlez '{self.topic}' en {self.language}.")
+            self._next_prompt=None
+            return []
+
+    def _handle_next(self):
+        self.idx+=1
+        key=f"{self.language}_{self.level}"
+        self.progress[key]=self.idx
+        save_progress(self.progress)
+        if self.idx<len(self.topics[self.level]):
+            self.topic=self.topics[self.level][self.idx]
+            return [f"Next: {self.topic}"]
+        network.stop()
+        return ["Done!"]
+
+    def _handle_exit(self):
+        key=f"{self.language}_{self.level}"
+        self.progress[key]=self.idx
+        save_progress(self.progress)
+        
+        network.stop()
+        return ["Exit."]
 
 class GeminiLLMModule(AbstractModule):
+    
     @staticmethod
     def name():
         return "Gemini LLM Module"
 
     @staticmethod
     def description():
-        return "A module that streams responses from Gemini LLM given a user prompt."
+        return "Queries Gemini and streams TextIU responses."
 
     @staticmethod
     def input_ius():
@@ -69,148 +206,70 @@ class GeminiLLMModule(AbstractModule):
 
     def __init__(
         self,
-        conversation_language,
-        topic,
-        difficulty_level,
-        explanation_language,
+        language: str,
+        topic: str,
+        difficulty_level: str,
+        explanation_language: str = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.conversation_language = conversation_language
+        self.language = language
         self.topic = topic
         self.difficulty_level = difficulty_level
-        self.explanation_language = explanation_language
-        self.gemini = Gemini(
-            system_instructions=SYSTEM_PROMPT.format(
-                language=conversation_language,
-                topic=topic,
-                difficulty_level=difficulty_level,
-                explanation_language=explanation_language or conversation_language,
-            )
+        self.explanation_language = explanation_language or language
+        # Initialize Gemini client
+        system = SYSTEM_PROMPT.format(
+            language=self.language,
+            topic=self.topic,
+            difficulty_level=self.difficulty_level,
+            explanation_language=self.explanation_language,
         )
-        self.buffer = ""
-        self.topic_advanced = False
-        self.should_exit = False
+        self.gemini = Gemini(system_instructions=system)
+        # Buffer for incremental text
+        self.buffer = []  # list of segments
 
-    def process_update(self, update):
-        user_input = update.text.strip()
-        if user_input.lower() == "next":
-            self.topic_advanced = True
-            print("Moving to the next topic...")
-            network.stop()
-            return
-        if user_input.lower() == "exit":
-            self.should_exit = True
-            print("Exiting. Progress saved.")
-            network.stop()
-            return
-        self.buffer = ""
-        for chunk in self.gemini.add_turn(user_input):
-            self.buffer += chunk
-            self.append(TextIU(text=chunk))
-
-
-class ConversationParameterModule(AbstractModule):
-    @staticmethod
-    def name():
-        return "Conversation Parameter Module"
-
-    @staticmethod
-    def description():
-        return "A module that collects conversation parameters from the user."
-
-    @staticmethod
-    def input_ius():
-        return []
-
-    @staticmethod
-    def output_iu():
-        return TextIU
-
-    def __init__(self, topics, **kwargs):
-        super().__init__(**kwargs)
-        self.topics = topics
-        self.language = None
-        self.level = None
-        self.topic = None
-        self.difficulty_level = None
-        self.explanation_language = None
-        self.idx = 0
-        self._paused = False
-
-    def run(self):
-        print("Welcome to the Retico Language Practice System!")
-        self.language = input("Which language do you want to practice? (e.g., French, English, Magyar): ")
-        levels = list(self.topics.keys())
-        print("Available levels:", ", ".join(levels).strip(", "))
-        self.level = input(f"Choose your level {levels}: ")
-        if self.level not in self.topics:
-            print("Invalid level. Defaulting to A1.")
-            self.level = "A1"
-        self.difficulty_level = self.level
-        self.explanation_language = input(f"In which language do you want explanations? (default: {self.language}): ") or self.language
-        topics = self.topics[self.level]
-        self.idx = 0
-        print("Available topics:")
-        for i, t in enumerate(topics):
-            print(f"{i+1}. {t}")
-        topic_choice = input(f"Choose a topic by number (1-{len(topics)}) or press Enter for the first: ")
-        if topic_choice.isdigit() and 1 <= int(topic_choice) <= len(topics):
-            self.idx = int(topic_choice) - 1
-        self.topic = topics[self.idx]
-        # Pass IU to next module
-        self.append(TextIU(text=f"LANG:{self.language}|LEVEL:{self.level}|TOPIC:{self.topic}|EXPL:{self.explanation_language}|IDX:{self.idx}", iuid = 0))
-        self._paused = True
-        return self.language, self.topic, self.difficulty_level, self.explanation_language, self.idx
-
-    def process_update(self, update):
-        # No-op: this module only produces IU at start
-        pass
-
+    def process_update(self, update: UpdateMessage):
+        for iu, ut in update:
+            if not isinstance(iu, TextIU):
+                continue
+            text = iu.text
+            if ut == UpdateType.ADD:
+                self.buffer.append(text)
+            if iu.committed:
+                # Concatenate the buffer
+                user_input = ' '.join(self.buffer).strip()
+                print("User input:", user_input)
+                self.buffer.clear()
+                if not user_input:
+                    return
+                # Send to Gemini and stream response
+                um = UpdateMessage()
+                for chunk in self.gemini.add_turn(user_input):
+                    out_iu = TextIU(iuid=iu.iuid)
+                    iu.payload = iu.text = chunk
+                    print(out_iu.text)
+                    um.add_iu(out_iu, UpdateType.ADD)
+                    self.append(um)
 
 if __name__ == "__main__":
-    try:
-        progress = load_progress()
-        param_mod = ConversationParameterModule(TOPICS)
-        # Lancer la pipeline avec param_mod comme source
-        # Les modules suivants doivent être créés dynamiquement après réception des paramètres
-        language, topic, level, explanation_language, idx = param_mod.run()
-        user_key = f"{language}_{level}"
-        topics = TOPICS[level]
-        while idx < len(topics):
-            topic = topics[idx]
-            print(f"Your next topic is: {topic}")
-            llm = GeminiLLMModule(
-                conversation_language=language,
-                topic=topic,
-                difficulty_level=level,
-                explanation_language=explanation_language
-            )
-            lang = LanguageDetectionModule()
-            tts = MultilingualTTSModule(language=llm.conversation_language)
-            # Pipeline : param_mod -> llm -> lang -> tts
-            param_mod.subscribe(llm)
-            llm.subscribe(lang)
-            lang.subscribe(tts)
-            print("Type 'next' to move to the next topic, or 'exit' to quit.")
-            network.run(param_mod)
-            if hasattr(llm, "topic_advanced") and llm.topic_advanced:
-                idx += 1
-                progress[user_key] = idx
-                save_progress(progress)
-                print("Moving to the next topic...")
-                continue
-            if hasattr(llm, "should_exit") and llm.should_exit:
-                print("Exiting. Progress saved.")
-                progress[user_key] = idx
-                save_progress(progress)
-                exit()
-        print("Congratulations! You have completed all topics for this level.")
-        progress[user_key] = idx
-        save_progress(progress)
-    except KeyboardInterrupt:
-        print("\nExiting dialogue. Progress saved.")
-        if user_key in progress:
-            progress[user_key] = idx
-        save_progress(progress)
-        exit()
+    mic = MicrophoneModule(rate=16000)
+    lgd = LanguageDetectionModule()
+    asr = GoogleASRModule(rate=16000)
+    llm = GeminiLLMModule(
+        language="French",
+        topic="Sport",
+        difficulty_level="B2",
+        explanation_language="English"
+    )
+    tts = MultilingualTTSModule(language="fr")
+    spk = SpeakerModule(rate=22050)
+    # llm = AudioParameterGeminiModule(TOPICS)
+    
+    mic.subscribe(lgd)
+    lgd.subscribe(asr)
+    asr.subscribe(llm)
+    llm.subscribe(tts)
+    
+    network.run(mic)
+    input("Running...\n")
+    network.stop(mic)
