@@ -17,6 +17,7 @@ class Gemini:
         seed: Union[int, Literal["random"]] = "random",
         max_output_tokens: int = 65535,
         thinking_budget: int = 2048,
+        contents: Union[list[types.Content], None] = None,
     ):
         self.system_instructions = system_instructions
         self.model = model
@@ -25,7 +26,7 @@ class Gemini:
         self.seed = seed
         self.max_output_tokens = max_output_tokens
         self.thinking_budget = thinking_budget
-        self.contents: list[types.Content] = []
+        self.contents: list[types.Content] = contents if contents is not None else []
         self.client = genai.Client(
             vertexai=True,
             project=os.environ.get("PROJECT", "missing-project-id"),
