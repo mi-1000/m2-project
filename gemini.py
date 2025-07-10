@@ -1,4 +1,7 @@
+import io
 import os
+import wave
+
 from dotenv import load_dotenv
 from typing import Any, Generator, Literal, Union
 
@@ -28,10 +31,9 @@ class Gemini:
         self.thinking_budget = thinking_budget
         self.contents: list[types.Content] = contents if contents is not None else []
         self.client = genai.Client(
-            vertexai=True,
-            project=os.environ.get("PROJECT", "missing-project-id"),
-            location="global",
+            api_key=os.environ.get("API_KEY", "missing-api-key"),
         )
+        
 
     def add_turn(self, user_input: str) -> Generator[str, Any, None]:
         """
@@ -43,11 +45,12 @@ class Gemini:
                 parts=[types.Part.from_text(text=user_input)],
             )
         )
+        
         response = ""
         for chunk in self._generate_text(self.contents):
             response += chunk
             yield chunk
-        # append full response to context
+            
         self.contents.append(
             types.Content(
                 role="model",
@@ -59,10 +62,19 @@ class Gemini:
         """
         Add a user turn with raw audio and stream back the model's textual response.
         """
+
+        buffer = io.BytesIO() # Convert PCM bytes to WAV
+        with wave.open(buffer, "wb") as wf:
+            wf.setnchannels(1)            # mono
+            wf.setsampwidth(2)            # 16‑bit = 2 bytes
+            wf.setframerate(16000)        # 16000 Hz by default
+            wf.writeframes(audio_bytes)
+        wav_bytes = buffer.getvalue()
+
         self.contents.append(
             types.Content(
                 role="user",
-                parts=[types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")],
+                parts=[types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav")],
             )
         )
 
