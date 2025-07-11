@@ -2,6 +2,8 @@ import json
 import numpy as np
 import os
 import threading
+import webrtcvad
+
 from collections import deque
 from typing import Literal, Union
 
@@ -35,16 +37,20 @@ If asked, give cultural info, vocabulary, or grammar tips. Always be encouraging
 
 Start by greeting the user in {language} and asking a simple question about “{topic}” at level {difficulty_level}, when the user is ready to start the conversation. Do not converse until the user has provided all necessary parameters.
 
+Be familiar, friendly amd helpful to the user. This includes using a friendly tone, using the user's name if provided, and being encouraging and supportive throughout the conversation.
+
+Always ask a follow-up question whenever you reply, do not let the conversation die out unless explicitely told by the user.
+
 - When is the user ready to start the conversation?
 -> You will first have a phase of parameter collection (if needed). Your goal is to collect the following parameters from the user:
 1. `language`: The language the user wants to practice (e.g., "French", "English"). Should be converted to ISO 639-1.
-2. `topic`: The chosen topic for the conversation. If you set `topic` to `True`, this will be further defined by the current user's progress in the default language learning track. In consequence, you should ask if the user wants to start/continue on this curated track, or pick a custom topic.
+2. `topic`: The chosen topic for the conversation. If you set `topic` to `True`, this will be further defined by the current user's progress in the default language learning track. In consequence, you should ask if the user wants to start/continue on this curated track, or pick a custom topic. If the user chooses the default track, the `topic` variable will be set to the next topic in the list of topics for the current language. You should confirm this to the user, once you have a value for that variable.
 3. `difficulty_level`: The user's proficiency level, that should be converted to an approximate CECRL equivalent (A1 to C2). You can ask for this directly, or infer it from the user's input.
 4. `explanation_language`: The language for grammar explanations, which might be different from the conversation language (e.g., if the user wants to practice French but prefers explanations in English).
 -> They are set at `None` by default. As long as they are not None, you can consider them set. If the user tells you about one of these parameters during the initial phase, you will update your internal state accordingly.
 
 Your Interaction Flow:
-- Start by asking for the `language`. You can default to English is {language} is not set, but should switch to the user's preferred language as soon as it is set.
+- Start by asking for the `language`. You can default to English is {language} is not set, but should switch to the user's preferred language as soon as it is set. If the user is saying to be struggling in the language you are using, you should adapt to it and use the user's preffered language more often while reducing the amount of utterances in the target language, if these two are different.
 - Analyze the user's response. They might provide multiple details at once.
 - For each piece of information you gather, update your internal state.
 - **Your response MUST be a JSON object.**
@@ -66,12 +72,13 @@ Here are the information that you already have about the user parameters:
 with open(os.path.join(os.path.dirname(__file__), "topics.json"), encoding="utf-8") as f:
     TOPICS: dict[str, list[str]] = json.load(f)
 
-# Persistence
+# Progress of the user in the language learning track
 PROGRESS_FILE = os.path.join(os.path.dirname(__file__), "user_progress.json")
 
 def load_progress():
     if os.path.exists(PROGRESS_FILE):
         try:
+            print("Loaded user progress from", PROGRESS_FILE)
             return json.load(open(PROGRESS_FILE, encoding="utf-8"))
         except json.JSONDecodeError:
             return {}
@@ -79,6 +86,40 @@ def load_progress():
 
 def save_progress(progress):
     json.dump(progress, open(PROGRESS_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+
+def frame_generator(frame_duration_ms: int, audio: bytes, sample_rate: int):
+    """
+    Split `audio` (PCM16 bytes) into frames of `frame_duration_ms` milliseconds.
+    Yields tuples of (frame_bytes, timestamp_ms).
+    """
+    bytes_per_frame = int(sample_rate * (frame_duration_ms / 1000.0)) * 2
+    offset = 0
+    timestamp = 0.0
+    while offset + bytes_per_frame <= len(audio):
+        yield audio[offset : offset + bytes_per_frame], timestamp
+        timestamp += frame_duration_ms
+        offset += bytes_per_frame
+
+def has_speech(
+    audio: bytes,
+    sample_rate: int,
+    frame_duration_ms: int = 30,
+    aggressiveness: int = 2,
+    speech_frame_threshold: float = 0.1
+) -> bool:
+    """
+    Return True if at least `speech_frame_threshold` proportion of frames
+    contain speech according to WebRTC VAD.
+    """
+    vad = webrtcvad.Vad(aggressiveness)
+    frames = list(frame_generator(frame_duration_ms, audio, sample_rate))
+    if not frames:
+        return False
+    speech_frames = 0
+    for frame_bytes, _ in frames:
+        if vad.is_speech(frame_bytes, sample_rate):
+            speech_frames += 1
+    return (speech_frames / len(frames)) >= speech_frame_threshold
 
 class GeminiLLMModule(AbstractModule):
     
@@ -160,52 +201,22 @@ class GeminiLLMModule(AbstractModule):
             
                 if ut == UpdateType.ADD:
                     self.in_audio_buffer.append(iu.raw_audio)
-                
+
                 np_audio = np.frombuffer(b"".join(self.in_audio_buffer), dtype="<i2").astype(np.float32) / 32768
                 rms = np.sqrt(np.mean(np_audio**2))
-                if rms > 0.01: # We consider that this is not silence
+                
+                if rms > 0.015: # We consider that this level of voice activity means the user is speaking
                     self._speech_started = True
                 
-                if self._speech_started and is_tail_silence_or_noise(np_audio, iu.rate, silent_tail_size=1.0):
-                    um = UpdateMessage()
+                if self._speech_started and has_speech(b"".join(self.in_audio_buffer), iu.rate) and is_tail_silence_or_noise(np_audio, iu.rate, silent_tail_size=1.0):
                     audio_input = b"".join(self.in_audio_buffer)
                     self.in_audio_buffer.clear()  # Clear the buffer after processing
                     self._speech_started = False
+                    um = UpdateMessage()
                     
                     for chunk in self.gemini.add_audio_turn(audio_input):
                         self.out_buffer += chunk
-                        if self.out_buffer.startswith("{"):
-                            if not self.out_buffer.endswith("}"):
-                                continue
-                            try: # If we are setting up the conversation parameters
-                                response = json.loads(self.out_buffer)
-                                if isinstance(response, dict) and "language" in response and "topic" in response and "difficulty_level" in response and "explanation_language" and "response" in response:
-                                    self.language = response["language"]
-                                    self.topic = response["topic"]
-                                    if isinstance(self.topic, bool) and self.topic:
-                                        progress = load_progress()
-                                        if progress and hasattr(progress, self.language):
-                                            self.custom_topic_id = (TOPICS.get(self.language)[progress[self.language] + 1], None)
-                                            save_progress({f"{self.language}": self.custom_topic_id})
-                                    self.difficulty_level = response["difficulty_level"]
-                                    self.explanation_language = response["explanation_language"]
-                                    utterance = response["response"]
-                                    
-                                    out_iu = TextIU(iuid=0, previous_iu=self._last_iu)
-                                    out_iu.payload = out_iu.text = utterance
-                                    self.out_buffer = ""
-                                    um.add_iu(out_iu, UpdateType.ADD)
-                                    self.append(um)
-                            except json.JSONDecodeError:
-                                print("Invalid JSON response:", self.out_buffer)
-                            finally:
-                                self.out_buffer = ""
-                        elif self.out_buffer.endswith((".", "!", "?")): # Only send full sentences
-                            out_iu = TextIU(iuid=0, previous_iu=self._last_iu)
-                            out_iu.payload = out_iu.text = self.out_buffer
-                            self.out_buffer = ""
-                            um.add_iu(out_iu, UpdateType.ADD)
-                            self.append(um)
+                        self.process_json_from_llm(um)
     
     def _on_timeout(self):
         user_input = ' '.join(self.in_text_buffer).strip()
@@ -217,38 +228,7 @@ class GeminiLLMModule(AbstractModule):
         um = UpdateMessage()
         for chunk in self.gemini.add_turn(user_input):
             self.out_buffer += chunk
-            if self.out_buffer.startswith("{"):
-                if not self.out_buffer.endswith("}"):
-                    continue
-                try: # If we are setting up the conversation parameters
-                    response = json.loads(self.out_buffer)
-                    if isinstance(response, dict) and "language" in response and "topic" in response and "difficulty_level" in response and "explanation_language" and "response" in response:
-                        self.language = response["language"]
-                        self.topic = response["topic"]
-                        if isinstance(self.topic, bool) and self.topic:
-                            progress = load_progress()
-                            if progress and hasattr(progress, self.language):
-                                self.custom_topic_id = (TOPICS.get(self.language)[progress[self.language] + 1], None)
-                                save_progress({f"{self.language}": self.custom_topic_id})
-                        self.difficulty_level = response["difficulty_level"]
-                        self.explanation_language = response["explanation_language"]
-                        utterance = response["response"]
-                        
-                        out_iu = TextIU(iuid=0, previous_iu=self._last_iu)
-                        out_iu.payload = out_iu.text = utterance
-                        self.out_buffer = ""
-                        um.add_iu(out_iu, UpdateType.ADD)
-                        self.append(um)
-                except json.JSONDecodeError:
-                    print("Invalid JSON response:", self.out_buffer)
-                finally:
-                    self.out_buffer = ""
-            elif self.out_buffer.endswith((".", "!", "?")): # Only send full sentences
-                out_iu = TextIU(iuid=0, previous_iu=self._last_iu)
-                out_iu.payload = out_iu.text = self.out_buffer
-                self.out_buffer = ""
-                um.add_iu(out_iu, UpdateType.ADD)
-                self.append(um)
+            self.process_json_from_llm(um)
     
     def _reset_timer(self):
         if self._timeout_timer is not None:
@@ -256,6 +236,41 @@ class GeminiLLMModule(AbstractModule):
         self._timeout_timer = threading.Timer(self._timeout_interval, self._on_timeout)
         self._timeout_timer.daemon = True
         self._timeout_timer.start()
+    
+    def process_json_from_llm(self, um: UpdateMessage):
+        if self.out_buffer.startswith("{"):
+            if not self.out_buffer.endswith("}"):
+                return
+            try: # If we are setting up the conversation parameters
+                response = json.loads(self.out_buffer)
+                if isinstance(response, dict) and "language" in response and "topic" in response and "difficulty_level" in response and "explanation_language" and "response" in response:
+                    self.language = response["language"]
+                    self.topic = response["topic"]
+                    if isinstance(self.topic, bool) and self.topic:
+                        progress = load_progress()
+                        if progress and hasattr(progress, self.language):
+                            self.custom_topic_id = (TOPICS.get(self.language)[progress[self.language] + 1], None)
+                            save_progress({f"{self.language}": self.custom_topic_id})
+                            self.topic = TOPICS.get(self.language)[self.custom_topic_id]
+                    self.difficulty_level = response["difficulty_level"]
+                    self.explanation_language = response["explanation_language"]
+                    utterance = response["response"]
+                    
+                    out_iu = TextIU(iuid=0, previous_iu=self._last_iu)
+                    out_iu.payload = out_iu.text = utterance
+                    self.out_buffer = ""
+                    um.add_iu(out_iu, UpdateType.ADD)
+                    self.append(um)
+            except json.JSONDecodeError:
+                print("Invalid JSON response:", self.out_buffer)
+            finally:
+                self.out_buffer = ""
+        elif self.out_buffer.endswith((".", "!", "?")): # Only send full sentences
+            out_iu = TextIU(iuid=0, previous_iu=self._last_iu)
+            out_iu.payload = out_iu.text = self.out_buffer
+            self.out_buffer = ""
+            um.add_iu(out_iu, UpdateType.ADD)
+            self.append(um)
 
 if __name__ == "__main__":
     mic = MicrophoneModule(rate=16000)

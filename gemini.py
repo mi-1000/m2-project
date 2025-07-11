@@ -48,8 +48,9 @@ class Gemini:
         
         response = ""
         for chunk in self._generate_text(self.contents):
-            response += chunk
-            yield chunk
+            if chunk is not None:
+                response += chunk
+                yield chunk
             
         self.contents.append(
             types.Content(
@@ -80,8 +81,9 @@ class Gemini:
 
         response = ""
         for chunk in self._generate_text(self.contents):
-            response += chunk
-            yield chunk
+            if chunk is not None:
+                response += chunk
+                yield chunk
 
         self.contents.append(
             types.Content(
@@ -98,7 +100,8 @@ class Gemini:
             types.Content(role="user", parts=[types.Part.from_text(text=user_input)])
         ]
         for chunk in self._generate_text(temp):
-            yield chunk
+            if chunk is not None:
+                yield chunk
 
     def clear_context(self):
         """
