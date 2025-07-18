@@ -2,8 +2,10 @@ import threading
 import queue
 import retico_core
 
+
 class SimpleTerminalInputIU(retico_core.IncrementalUnit):
     """IU pour l'entrée texte du terminal."""
+
     @staticmethod
     def type():
         return "Simple Terminal Input IU"
@@ -15,6 +17,7 @@ class SimpleTerminalInputIU(retico_core.IncrementalUnit):
     def set_text(self, text):
         self.text = text
         self.payload = text
+
 
 class SimpleTerminalInputModule(retico_core.AbstractProducingModule):
     """Module Retico conforme pour l'entrée texte utilisateur via le terminal."""

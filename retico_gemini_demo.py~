@@ -15,7 +15,7 @@ from retico_googleasr import GoogleASRModule
 from gemini import Gemini
 from LanguageDetectionModule.language_detection import LanguageDetectionModule, is_tail_silence_or_noise
 from LanguageDetectionModule.multilingual_tts import MultilingualTTSModule
-# from RobotFilterModule.filter import RobotASRFilterModule
+from RobotFilterModule.filter import RobotASRFilterModule
 
 SYSTEM_PROMPT = """
 You are a friendly and knowledgeable language tutor. Help the user practice {language} by having a short, natural conversation about “{topic}” at level {difficulty_level}.

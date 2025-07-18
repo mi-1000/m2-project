@@ -31,9 +31,8 @@ class Gemini:
         self.thinking_budget = thinking_budget
         self.contents: list[types.Content] = contents if contents is not None else []
         self.client = genai.Client(
-            api_key=os.environ.get("API_KEY", "missing-api-key"),
+            api_key=os.environ.get("GOOGLE_API_KEY", "missing-api-key"),
         )
-        
 
     def add_turn(self, user_input: str) -> Generator[str, Any, None]:
         """
@@ -104,9 +103,6 @@ class Gemini:
                 yield chunk
 
     def clear_context(self):
-        """
-        Reset conversation history.
-        """
         self.contents.clear()
 
     def _generate_text(self, contents: list[types.Content]) -> Generator[str, Any, None]:
