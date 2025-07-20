@@ -7,15 +7,11 @@ import webrtcvad
 from collections import deque
 from typing import Literal, Union
 
-from retico_core import network, AbstractModule, UpdateMessage, UpdateType
+from retico_core import AbstractModule, UpdateMessage, UpdateType
 from retico_core.text import TextIU
-from retico_core.audio import AudioIU, MicrophoneModule, SpeakerModule
-from retico_googleasr import GoogleASRModule
+from retico_core.audio import AudioIU
 
 from gemini import Gemini
-from LanguageDetectionModule.language_detection import LanguageDetectionModule, is_tail_silence_or_noise
-from LanguageDetectionModule.multilingual_tts import MultilingualTTSModule
-# from RobotFilterModule.filter import RobotASRFilterModule
 
 SYSTEM_PROMPT = """
 You are a friendly and knowledgeable language tutor. Help the user practice {language} by having a short, natural conversation about “{topic}” at level {difficulty_level}.
@@ -209,7 +205,7 @@ class GeminiLLMModule(AbstractModule):
                 if rms > 0.015: # We consider that this level of voice activity means the user is speaking
                     self._speech_started = True
                 
-                if self._speech_started and has_speech(b"".join(self.in_audio_buffer), iu.rate) and is_tail_silence_or_noise(np_audio, iu.rate, silent_tail_size=1.0):
+                if self._speech_started and has_speech(b"".join(self.in_audio_buffer), iu.rate) and self.is_tail_silence_or_noise(np_audio, iu.rate):
                     audio_input = b"".join(self.in_audio_buffer)
                     self.in_audio_buffer.clear()  # Clear the buffer after processing
                     self._speech_started = False
@@ -273,23 +269,23 @@ class GeminiLLMModule(AbstractModule):
             um.add_iu(out_iu, UpdateType.ADD)
             self.append(um)
 
-if __name__ == "__main__":
-    mic = MicrophoneModule(rate=16000)
-    lang_in = LanguageDetectionModule()
-    asr = GoogleASRModule(rate=16000)
-    llm = GeminiLLMModule()
-    lang_out = LanguageDetectionModule()
-    tts = MultilingualTTSModule()
-    # fil = RobotASRFilterModule()
-    spk = SpeakerModule(rate=22050)
-    
-    mic.subscribe(llm)
-    # asr.subscribe(lang_in)
-    # lang_in.subscribe(llm)
-    llm.subscribe(lang_out)
-    lang_out.subscribe(tts)
-    tts.subscribe(spk)
-    
-    network.run(mic)
-    input("Running...\n")
-    network.stop(mic)
+    @staticmethod
+    def is_tail_silence_or_noise(buffer: np.ndarray, rate: int, silent_tail_size: float = 1.0, silence_max_rms_energy_threshold = 0.01) -> bool:
+        """
+        Returns True if the last `tail_size` seconds of `buffer`
+        are essentially silence (low RMS) or noise (high spectral flatness).
+
+        :param buffer: the audio buffer to check
+        :param rate: the sample rate of the audio buffer (in Hz)
+        :param silent_tail_size: the size of the tail to check whether it's deemed silent or not (in seconds)
+        :param silence_max_rootmeansquare_energy_threshold: the maximum root mean square energy to consider the tail as silence (closer to 0: silence)
+        """
+
+        n_tail = int(silent_tail_size * rate)
+        if buffer.size < n_tail:
+            return False
+        tail = buffer[-n_tail:]
+        rms = np.sqrt(np.mean(tail**2))
+        if rms < silence_max_rms_energy_threshold:
+            return True
+        return False
