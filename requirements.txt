@@ -1,3 +1,4 @@
+google-genai
 lingua-language-detector==2.0.2
 numpy==1.22.0
 protobuf==6.31.1
