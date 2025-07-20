@@ -1,0 +1,177 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<domain>
+
+	<initialstate>
+
+		<variable id="firstname">
+			<value>None</value>
+		</variable>
+		<variable id="lastname">
+			<value>None</value>
+		</variable>
+		<variable id="work">
+			<value>None</value>
+		</variable>
+		<variable id="email">
+			<value>None</value>
+		</variable>
+		<variable id="notes">
+			<value>None</value>
+		</variable>
+
+		<variable id="decision">
+			<value>None</value>
+		</variable>
+
+		<variable id="concepts">
+			<value>None</value>
+		</variable>
+	</initialstate>
+
+	<model trigger="firstname,lastname,work,email,notes">
+
+		<rule id="all_filled">
+			<case>
+				<condition>
+					<if var="firstname" relation="!=" value="None"/>
+					<if var="lastname" relation="!=" value="None"/>
+					<if var="work" relation="!=" value="None"/>
+					<if var="email" relation="!=" value="None"/>
+					<if var="notes" relation="!=" value="None"/>
+				</condition>
+				<effect>
+					<set var="decision" value="all_slots_filled"/>
+				</effect>
+			</case>
+		</rule>
+
+
+		<rule id="ask_firstname">
+			<case>
+				<condition>
+					<if var="firstname" value="None"/>
+				</condition>
+				<effect>
+					<set var="decision" value="ask_about_firstname"/>
+				</effect>
+			</case>
+		</rule>
+
+		<rule id="ask_lastname">
+			<case>
+				<condition>
+					<if var="firstname" relation="!=" value="None"/>
+					<if var="lastname" value="None"/>
+				</condition>
+				<effect>
+					<set var="decision" value="ask_about_lastname"/>
+				</effect>
+			</case>
+		</rule>
+
+		<rule id="ask_work">
+			<case>
+				<condition>
+					<if var="lastname" relation="!=" value="None"/>
+					<if var="work" value="None"/>
+				</condition>
+				<effect>
+					<set var="decision" value="ask_about_work"/>
+				</effect>
+			</case>
+		</rule>
+
+		<rule id="ask_email">
+			<case>
+				<condition>
+					<if var="work" relation="!=" value="None"/>
+					<if var="email" value="None"/>
+				</condition>
+				<effect>
+					<set var="decision" value="ask_about_email"/>
+				</effect>
+			</case>
+		</rule>
+
+		<rule id="ask_notes">
+			<case>
+				<condition>
+					<if var="email" relation="!=" value="None"/>
+					<if var="notes" value="None"/>
+				</condition>
+				<effect>
+					<set var="decision" value="ask_about_notes"/>
+				</effect>
+			</case>
+		</rule>
+	</model>
+
+	<model trigger="decision">
+		<rule id="gen_ask_firstname">
+			<case>
+				<condition>
+					<if var="decision" value="ask_about_firstname"/>
+				</condition>
+				<effect>
+					<set var="concepts" value="What is the first name?"/>
+				</effect>
+			</case>
+		</rule>
+
+		<rule id="gen_ask_lastname">
+			<case>
+				<condition>
+					<if var="decision" value="ask_about_lastname"/>
+				</condition>
+				<effect>
+					<set var="concepts" value="What is the last name?"/>
+				</effect>
+			</case>
+		</rule>
+
+		<rule id="gen_ask_work">
+			<case>
+				<condition>
+					<if var="decision" value="ask_about_work"/>
+				</condition>
+				<effect>
+					<set var="concepts" value="Where does {firstname} work?"/>
+				</effect>
+			</case>
+		</rule>
+
+		<rule id="gen_ask_email">
+			<case>
+				<condition>
+					<if var="decision" value="ask_about_email"/>
+				</condition>
+				<effect>
+					<set var="concepts" value="What is {firstname}’s email address?"/>
+				</effect>
+			</case>
+		</rule>
+
+		<rule id="gen_ask_notes">
+			<case>
+				<condition>
+					<if var="decision" value="ask_about_notes"/>
+				</condition>
+				<effect>
+					<set var="concepts" value="Anything else to note about {firstname}?"/>
+				</effect>
+			</case>
+		</rule>
+
+		<rule id="gen_done">
+			<case>
+				<condition>
+					<if var="decision" value="all_slots_filled"/>
+				</condition>
+				<effect>
+					<set var="concepts" value="That's all I need for that person!"/>
+				</effect>
+			</case>
+		</rule>
+	</model>
+
+</domain>
